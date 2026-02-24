@@ -44,6 +44,7 @@ FALLBACK_PROJECTS = [
     ".月次作業",
 ]
 FALLBACK_TAGS = ["", "スキップ", "急ぎ", "自分", "会議中", "ミーティング"]
+DEFAULT_PUBLIC_APP_URL = "https://streamlitcsv.streamlit.app"
 TEMP_DOWNLOADS = {}
 
 
@@ -277,6 +278,16 @@ def make_qr_png(url: str) -> bytes:
     return buf.getvalue()
 
 
+def normalize_public_url(url: str) -> str:
+    text = (url or "").strip()
+    if text == "":
+        return ""
+    text = text.replace("https:://", "https://").replace("http:://", "http://")
+    if not text.startswith("http://") and not text.startswith("https://"):
+        text = "https://" + text
+    return text.rstrip("/")
+
+
 st.set_page_config(page_title="Task CSV Builder", layout="wide")
 query_token = st.query_params.get("token")
 if isinstance(query_token, list):
@@ -420,12 +431,15 @@ with dl_col1:
         index=0,
         help="Excelで文字化けする場合は cp932 を選択してください。",
     )
-    public_app_url = st.text_input(
+    public_app_url_raw = st.text_input(
         "公開URL（QR生成用）",
-        value=st.session_state.get("public_app_url", ""),
+        value=st.session_state.get("public_app_url", DEFAULT_PUBLIC_APP_URL),
         placeholder="https://xxxx.streamlit.app",
         help="Streamlit Cloud のアプリURLを入力してください。",
     ).strip()
+    if public_app_url_raw == "":
+        public_app_url_raw = DEFAULT_PUBLIC_APP_URL
+    public_app_url = normalize_public_url(public_app_url_raw)
     st.session_state["public_app_url"] = public_app_url
     share_ttl = st.number_input("一時保存（分）", min_value=1, max_value=30, value=5, step=1)
 
@@ -556,7 +570,7 @@ with dl_col1:
             st.error("先に「公開URL（QR生成用）」を入力してください。")
         else:
             token, expires_at = create_temp_download(csv_bytes, "tasks.csv", int(share_ttl))
-            base = st.session_state["public_app_url"].rstrip("/")
+            base = st.session_state["public_app_url"]
             share_url = f"{base}/?token={token}"
             st.session_state.share_token = token
             st.session_state.share_expires_at = expires_at
