@@ -1,11 +1,15 @@
 import re
 import zipfile
+import secrets
 from datetime import date, timedelta
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import pandas as pd
 import streamlit as st
+import qrcode
 
 
 COLUMNS = ["DueDate", "Schedule", "Section", "Project", "Tag", "TaskName", "Estimated"]
@@ -40,6 +44,7 @@ FALLBACK_PROJECTS = [
     ".月次作業",
 ]
 FALLBACK_TAGS = ["", "スキップ", "急ぎ", "自分", "会議中", "ミーティング"]
+TEMP_DOWNLOADS = {}
 
 
 def resolve_xlsm_path() -> Path | None:
@@ -239,7 +244,60 @@ def rows_from_task_lines(text: str, defaults: dict):
     )
 
 
+def cleanup_temp_downloads():
+    now = datetime.now(timezone.utc)
+    expired = [token for token, item in TEMP_DOWNLOADS.items() if item["expires_at"] <= now]
+    for token in expired:
+        del TEMP_DOWNLOADS[token]
+
+
+def create_temp_download(data: bytes, file_name: str, ttl_minutes: int) -> tuple[str, datetime]:
+    cleanup_temp_downloads()
+    token = secrets.token_urlsafe(18)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
+    TEMP_DOWNLOADS[token] = {"data": data, "file_name": file_name, "expires_at": expires_at}
+    return token, expires_at
+
+
+def get_temp_download(token: str):
+    cleanup_temp_downloads()
+    item = TEMP_DOWNLOADS.get(token)
+    if item is None:
+        return None
+    if item["expires_at"] <= datetime.now(timezone.utc):
+        del TEMP_DOWNLOADS[token]
+        return None
+    return item
+
+
+def make_qr_png(url: str) -> bytes:
+    img = qrcode.make(url)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 st.set_page_config(page_title="Task CSV Builder", layout="wide")
+query_token = st.query_params.get("token")
+if isinstance(query_token, list):
+    query_token = query_token[0] if query_token else ""
+if query_token:
+    item = get_temp_download(str(query_token))
+    st.title("一時ダウンロード")
+    if item is None:
+        st.error("このURLは無効か、有効期限切れです。PC側で再作成してください。")
+    else:
+        remaining = int((item["expires_at"] - datetime.now(timezone.utc)).total_seconds())
+        st.success(f"ダウンロード可能です（残り約 {max(0, remaining)} 秒）")
+        st.download_button(
+            "CSVをダウンロード",
+            data=item["data"],
+            file_name=item["file_name"],
+            mime="text/csv",
+            use_container_width=True,
+        )
+    st.stop()
+
 st.title("Task CSV Builder")
 st.caption("スプレッドシート形式で入力してCSVを出力します。Schedule列は時間入力（空欄可）です。")
 
@@ -261,6 +319,12 @@ if "table_df" not in st.session_state:
     st.session_state.table_df = pd.DataFrame(columns=COLUMNS)
 if "show_preview" not in st.session_state:
     st.session_state.show_preview = False
+if "share_token" not in st.session_state:
+    st.session_state.share_token = ""
+if "share_expires_at" not in st.session_state:
+    st.session_state.share_expires_at = None
+if "share_url" not in st.session_state:
+    st.session_state.share_url = ""
 
 current_df = st.session_state.table_df.copy()
 for col in ["Section", "Project", "Tag", "TaskName"]:
@@ -356,6 +420,14 @@ with dl_col1:
         index=0,
         help="Excelで文字化けする場合は cp932 を選択してください。",
     )
+    public_app_url = st.text_input(
+        "公開URL（QR生成用）",
+        value=st.session_state.get("public_app_url", ""),
+        placeholder="https://xxxx.streamlit.app",
+        help="Streamlit Cloud のアプリURLを入力してください。",
+    ).strip()
+    st.session_state["public_app_url"] = public_app_url
+    share_ttl = st.number_input("一時保存（分）", min_value=1, max_value=30, value=5, step=1)
 
 st.subheader("タスク入力シート")
 edited_df = st.data_editor(
@@ -479,8 +551,29 @@ with dl_col1:
         file_name="tasks.csv",
         mime="text/csv",
     )
+    if st.button("iPhone取り込み用 一時URLを作成", use_container_width=True):
+        if not st.session_state.get("public_app_url", "").strip():
+            st.error("先に「公開URL（QR生成用）」を入力してください。")
+        else:
+            token, expires_at = create_temp_download(csv_bytes, "tasks.csv", int(share_ttl))
+            base = st.session_state["public_app_url"].rstrip("/")
+            share_url = f"{base}/?token={token}"
+            st.session_state.share_token = token
+            st.session_state.share_expires_at = expires_at
+            st.session_state.share_url = share_url
 
 with dl_col2:
+    if st.session_state.share_url:
+        remain = int((st.session_state.share_expires_at - datetime.now(timezone.utc)).total_seconds())
+        if remain > 0:
+            st.caption(f"一時URL（残り約 {remain} 秒）")
+            st.code(st.session_state.share_url)
+            st.image(make_qr_png(st.session_state.share_url), caption="iPhoneでQRを読み取ってダウンロード")
+        else:
+            st.warning("一時URLの有効期限が切れました。再作成してください。")
+            st.session_state.share_url = ""
+            st.session_state.share_token = ""
+            st.session_state.share_expires_at = None
     if st.button("プレビュー表示"):
         st.session_state.show_preview = True
     if st.session_state.show_preview:
