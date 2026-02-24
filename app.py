@@ -1,6 +1,9 @@
 import re
 import zipfile
 import secrets
+import base64
+import zlib
+import json
 from datetime import date, timedelta
 from datetime import datetime, timezone
 from io import BytesIO
@@ -309,7 +312,56 @@ def current_app_base_url() -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def encode_csv_payload(data: bytes, ttl_minutes: int) -> str:
+    expires_at = int((datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)).timestamp())
+    envelope = {
+        "exp": expires_at,
+        "b64": base64.b64encode(data).decode("ascii"),
+    }
+    raw = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    compressed = zlib.compress(raw, level=9)
+    return base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
+
+
+def decode_csv_payload(payload: str) -> tuple[bytes | None, int | None]:
+    try:
+        pad = "=" * ((4 - len(payload) % 4) % 4)
+        compressed = base64.urlsafe_b64decode(payload + pad)
+        raw = zlib.decompress(compressed)
+        envelope = json.loads(raw.decode("utf-8"))
+        exp = int(envelope.get("exp", 0))
+        if exp <= int(datetime.now(timezone.utc).timestamp()):
+            return None, exp
+        data = base64.b64decode(envelope["b64"])
+        return data, exp
+    except Exception:
+        return None, None
+
+
 st.set_page_config(page_title="Task CSV Builder", layout="wide")
+query_payload = st.query_params.get("payload")
+if isinstance(query_payload, list):
+    query_payload = query_payload[0] if query_payload else ""
+if query_payload:
+    payload_data, payload_exp = decode_csv_payload(str(query_payload))
+    st.title("CSVダウンロード")
+    if payload_data is None:
+        if payload_exp is not None:
+            st.error("このURLは有効期限切れです。PC側で再作成してください。")
+        else:
+            st.error("共有URLが壊れているか、非対応のデータです。")
+    else:
+        remain = max(0, payload_exp - int(datetime.now(timezone.utc).timestamp()))
+        st.success(f"ダウンロード可能です（残り約 {remain} 秒）")
+        st.download_button(
+            "CSVをダウンロード",
+            data=payload_data,
+            file_name="tasks.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    st.stop()
+
 query_token = st.query_params.get("token")
 if isinstance(query_token, list):
     query_token = query_token[0] if query_token else ""
@@ -591,11 +643,11 @@ with dl_col1:
         if not st.session_state.get("public_app_url", "").strip():
             st.error("先に「公開URL（QR生成用）」を入力してください。")
         else:
-            token, expires_at = create_temp_download(csv_bytes, "tasks.csv", int(share_ttl))
             base = st.session_state["public_app_url"]
-            share_url = f"{base}/?token={token}"
-            st.session_state.share_token = token
-            st.session_state.share_expires_at = expires_at
+            payload = encode_csv_payload(csv_bytes, int(share_ttl))
+            share_url = f"{base}/?payload={payload}"
+            st.session_state.share_token = ""
+            st.session_state.share_expires_at = datetime.now(timezone.utc) + timedelta(minutes=int(share_ttl))
             st.session_state.share_url = share_url
 
 with dl_col2:
