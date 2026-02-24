@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
 import pandas as pd
@@ -283,9 +284,29 @@ def normalize_public_url(url: str) -> str:
     if text == "":
         return ""
     text = text.replace("https:://", "https://").replace("http:://", "http://")
+    # If multiple URLs were concatenated, keep the last one.
+    if text.count("http://") + text.count("https://") >= 2:
+        last_https = text.rfind("https://")
+        last_http = text.rfind("http://")
+        start = max(last_https, last_http)
+        if start >= 0:
+            text = text[start:]
     if not text.startswith("http://") and not text.startswith("https://"):
         text = "https://" + text
     return text.rstrip("/")
+
+
+def current_app_base_url() -> str:
+    try:
+        current = str(st.context.url)
+    except Exception:
+        current = ""
+    if not current:
+        return DEFAULT_PUBLIC_APP_URL
+    parsed = urlsplit(current)
+    if not parsed.scheme or not parsed.netloc:
+        return DEFAULT_PUBLIC_APP_URL
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 st.set_page_config(page_title="Task CSV Builder", layout="wide")
@@ -431,14 +452,15 @@ with dl_col1:
         index=0,
         help="Excelで文字化けする場合は cp932 を選択してください。",
     )
+    auto_public_url = current_app_base_url()
     public_app_url_raw = st.text_input(
         "公開URL（QR生成用）",
-        value=st.session_state.get("public_app_url", DEFAULT_PUBLIC_APP_URL),
+        value=st.session_state.get("public_app_url", auto_public_url),
         placeholder="https://xxxx.streamlit.app",
-        help="Streamlit Cloud のアプリURLを入力してください。",
+        help="通常は自動で現在のアプリURLを使います。必要時のみ変更してください。",
     ).strip()
     if public_app_url_raw == "":
-        public_app_url_raw = DEFAULT_PUBLIC_APP_URL
+        public_app_url_raw = auto_public_url
     public_app_url = normalize_public_url(public_app_url_raw)
     st.session_state["public_app_url"] = public_app_url
     share_ttl = st.number_input("一時保存（分）", min_value=1, max_value=30, value=5, step=1)
