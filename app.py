@@ -8,10 +8,12 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
 import qrcode
+import requests
 
 
 COLUMNS = ["DueDate", "Schedule", "Section", "Project", "Tag", "TaskName", "Estimated"]
@@ -331,6 +333,53 @@ def current_app_base_url() -> str:
     if not parsed.scheme or not parsed.netloc:
         return DEFAULT_PUBLIC_APP_URL
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def get_supabase_config() -> tuple[str, str, str]:
+    try:
+        url = str(st.secrets.get("SUPABASE_URL", "")).strip().rstrip("/")
+        key = str(st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")).strip()
+        bucket = str(st.secrets.get("SUPABASE_BUCKET", "")).strip()
+        return url, key, bucket
+    except Exception:
+        return "", "", ""
+
+
+def create_supabase_signed_csv_url(data: bytes, ttl_minutes: int) -> tuple[str, str]:
+    supabase_url, supabase_key, supabase_bucket = get_supabase_config()
+    if not supabase_url or not supabase_key or not supabase_bucket:
+        return "", "Supabase Secretsが未設定です。"
+
+    object_path = f"tmp/tasks_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}.csv"
+    headers = {
+        "Authorization": f"Bearer {supabase_key}",
+        "apikey": supabase_key,
+        "Content-Type": "text/csv",
+        "x-upsert": "true",
+    }
+    upload_url = f"{supabase_url}/storage/v1/object/{supabase_bucket}/{object_path}"
+
+    try:
+        upload_res = requests.post(upload_url, headers=headers, data=data, timeout=20)
+        if upload_res.status_code not in (200, 201):
+            return "", f"アップロード失敗: {upload_res.status_code}"
+    except Exception as exc:
+        return "", f"アップロード通信エラー: {exc}"
+
+    sign_url = f"{supabase_url}/storage/v1/object/sign/{supabase_bucket}/{object_path}"
+    sign_payload = {"expiresIn": int(ttl_minutes * 60)}
+    try:
+        sign_res = requests.post(sign_url, headers=headers, json=sign_payload, timeout=20)
+        if sign_res.status_code != 200:
+            return "", f"署名URL作成失敗: {sign_res.status_code}"
+        signed_url = sign_res.json().get("signedURL", "")
+        if not signed_url:
+            return "", "署名URLの取得に失敗しました。"
+        if signed_url.startswith("http://") or signed_url.startswith("https://"):
+            return signed_url, ""
+        return f"{supabase_url}{signed_url}", ""
+    except Exception as exc:
+        return "", f"署名URL通信エラー: {exc}"
 
 
 def encode_csv_payload(data: bytes, ttl_minutes: int) -> str:
@@ -681,9 +730,12 @@ with dl_col1:
         use_container_width=True,
     )
     if btn2.button("iPhone取り込み用一時URLを作成", use_container_width=True):
-        base = normalize_public_url(current_app_base_url())
-        payload = encode_csv_payload(csv_bytes, FIXED_SHARE_TTL_MINUTES)
-        share_url = f"{base}/?payload={payload}"
+        share_url, err = create_supabase_signed_csv_url(csv_bytes, FIXED_SHARE_TTL_MINUTES)
+        if not share_url:
+            base = normalize_public_url(current_app_base_url())
+            payload = encode_csv_payload(csv_bytes, FIXED_SHARE_TTL_MINUTES)
+            share_url = f"{base}/?payload={payload}"
+            st.warning(f"Supabase URL作成に失敗したため、アプリ内一時URLで作成しました: {err}")
         st.session_state.share_token = ""
         st.session_state.share_expires_at = datetime.now(timezone.utc) + timedelta(minutes=FIXED_SHARE_TTL_MINUTES)
         st.session_state.share_url = share_url
