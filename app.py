@@ -409,7 +409,13 @@ def create_supabase_signed_csv_url(data: bytes, ttl_minutes: int) -> tuple[str, 
 
             if signed_url.startswith("http://") or signed_url.startswith("https://"):
                 return signed_url, ""
-            return f"{supabase_url}{signed_url}", ""
+            if signed_url.startswith("/storage/v1/"):
+                return f"{supabase_url}{signed_url}", ""
+            if signed_url.startswith("/object/"):
+                return f"{supabase_url}/storage/v1{signed_url}", ""
+            if signed_url.startswith("object/"):
+                return f"{supabase_url}/storage/v1/{signed_url}", ""
+            return f"{supabase_url}/{signed_url.lstrip('/')}", ""
         except Exception as exc:
             last_error = f"署名URL通信エラー: {exc}"
 
