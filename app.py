@@ -351,16 +351,21 @@ def create_supabase_signed_csv_url(data: bytes, ttl_minutes: int) -> tuple[str, 
         return "", "Supabase Secretsが未設定です。"
 
     object_path = f"tmp/tasks_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}.csv"
-    headers = {
+    upload_headers = {
         "Authorization": f"Bearer {supabase_key}",
         "apikey": supabase_key,
         "Content-Type": "text/csv",
         "x-upsert": "true",
     }
+    sign_headers = {
+        "Authorization": f"Bearer {supabase_key}",
+        "apikey": supabase_key,
+        "Content-Type": "application/json",
+    }
     upload_url = f"{supabase_url}/storage/v1/object/{supabase_bucket}/{object_path}"
 
     try:
-        upload_res = requests.post(upload_url, headers=headers, data=data, timeout=20)
+        upload_res = requests.post(upload_url, headers=upload_headers, data=data, timeout=20)
         if upload_res.status_code not in (200, 201):
             return "", f"アップロード失敗: {upload_res.status_code}"
     except Exception as exc:
@@ -384,7 +389,7 @@ def create_supabase_signed_csv_url(data: bytes, ttl_minutes: int) -> tuple[str, 
     last_error = ""
     for sign_url, sign_payload in sign_attempts:
         try:
-            sign_res = requests.post(sign_url, headers=headers, json=sign_payload, timeout=20)
+            sign_res = requests.post(sign_url, headers=sign_headers, json=sign_payload, timeout=20)
             if sign_res.status_code != 200:
                 body = sign_res.text[:200]
                 last_error = f"署名URL作成失敗: {sign_res.status_code} {body}"
