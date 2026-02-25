@@ -366,20 +366,49 @@ def create_supabase_signed_csv_url(data: bytes, ttl_minutes: int) -> tuple[str, 
     except Exception as exc:
         return "", f"アップロード通信エラー: {exc}"
 
-    sign_url = f"{supabase_url}/storage/v1/object/sign/{supabase_bucket}/{object_path}"
-    sign_payload = {"expiresIn": int(ttl_minutes * 60)}
-    try:
-        sign_res = requests.post(sign_url, headers=headers, json=sign_payload, timeout=20)
-        if sign_res.status_code != 200:
-            return "", f"署名URL作成失敗: {sign_res.status_code}"
-        signed_url = sign_res.json().get("signedURL", "")
-        if not signed_url:
-            return "", "署名URLの取得に失敗しました。"
-        if signed_url.startswith("http://") or signed_url.startswith("https://"):
-            return signed_url, ""
-        return f"{supabase_url}{signed_url}", ""
-    except Exception as exc:
-        return "", f"署名URL通信エラー: {exc}"
+    sign_attempts = [
+        (
+            f"{supabase_url}/storage/v1/object/sign/{supabase_bucket}/{object_path}",
+            {"expiresIn": int(ttl_minutes * 60)},
+        ),
+        (
+            f"{supabase_url}/storage/v1/object/sign/{supabase_bucket}",
+            {"path": object_path, "expiresIn": int(ttl_minutes * 60)},
+        ),
+        (
+            f"{supabase_url}/storage/v1/object/sign/{supabase_bucket}",
+            {"paths": [object_path], "expiresIn": int(ttl_minutes * 60)},
+        ),
+    ]
+
+    last_error = ""
+    for sign_url, sign_payload in sign_attempts:
+        try:
+            sign_res = requests.post(sign_url, headers=headers, json=sign_payload, timeout=20)
+            if sign_res.status_code != 200:
+                body = sign_res.text[:200]
+                last_error = f"署名URL作成失敗: {sign_res.status_code} {body}"
+                continue
+
+            body = sign_res.json()
+            signed_url = body.get("signedURL", "")
+            if not signed_url and isinstance(body.get("signedUrls"), list) and body["signedUrls"]:
+                first = body["signedUrls"][0]
+                if isinstance(first, dict):
+                    signed_url = first.get("signedURL", "") or first.get("signedUrl", "")
+                elif isinstance(first, str):
+                    signed_url = first
+            if not signed_url:
+                last_error = "署名URLの取得に失敗しました。"
+                continue
+
+            if signed_url.startswith("http://") or signed_url.startswith("https://"):
+                return signed_url, ""
+            return f"{supabase_url}{signed_url}", ""
+        except Exception as exc:
+            last_error = f"署名URL通信エラー: {exc}"
+
+    return "", last_error or "署名URL作成に失敗しました。"
 
 
 def encode_csv_payload(data: bytes, ttl_minutes: int) -> str:
