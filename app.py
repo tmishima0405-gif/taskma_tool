@@ -1,5 +1,4 @@
 import re
-import zipfile
 import secrets
 import base64
 import zlib
@@ -9,7 +8,6 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
-from xml.etree import ElementTree as ET
 
 import pandas as pd
 import streamlit as st
@@ -17,66 +15,31 @@ import qrcode
 
 
 COLUMNS = ["DueDate", "Schedule", "Section", "Project", "Tag", "TaskName", "Estimated"]
-NS_MAIN = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-NS_RELS = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
-FALLBACK_SECTIONS = [
-    "00:00",
-    "05:00",
-    "07:00",
-    "08:00",
-    "10:00",
-    "11:00",
-    "13:00",
-    "14:00",
-    "16:00",
-    "17:00",
-    "19:00",
-    "21:00",
-    "22:00",
+UI_COLUMN_ORDER = ["DueDate", "Schedule", "Section", "Project", "Tag", "Estimated", "TaskName"]
+INPUT_COL_RATIOS = [0.7, 0.6, 0.6, 0.7, 0.7, 0.6, 2.2]
+ESTIMATED_OPTIONS = [i for i in range(5, 121, 5)]
+ESTIMATED_OTHER = "その他"
+LIST_OPTIONS_PATH = Path(__file__).parent / "list_options.json"
+DEFAULT_SECTIONS = ["05:00", "07:00", "08:00", "10:00", "11:00", "13:00", "14:00", "16:00", "19:00", "21:00", "22:00", "00:00"]
+DEFAULT_PROJECTS = [
+    ". プロジェクト化",
+    ". 重要",
+    ". 家のこと",
+    ". 改善",
+    ". 他",
+    ". 情報",
+    ". 家族",
+    ". 整理",
+    ". 勉強",
+    ". 娯楽",
+    ". オペ-90 臨時",
+    ". 雑務",
 ]
-FALLBACK_PROJECTS = [
-    ".重要",
-    ".情報",
-    ".雑務",
-    ".家族",
-    ".家のこと",
-    ".整理",
-    ".勉強",
-    ".他",
-    ".娯楽",
-    ".オペ-90 臨時",
-    ".月次作業",
-]
-FALLBACK_TAGS = ["", "スキップ", "急ぎ", "自分", "会議中", "ミーティング"]
+DEFAULT_TAGS = ["", "電車", "ミーティング", "スキップ", "自分", "会議中", "プログラミング"]
 DEFAULT_PUBLIC_APP_URL = "https://streamlitcsv.streamlit.app"
+FIXED_CSV_ENCODING = "utf-8-sig"
+FIXED_SHARE_TTL_MINUTES = 10
 TEMP_DOWNLOADS = {}
-
-
-def resolve_xlsm_path() -> Path | None:
-    base = Path(__file__).parent
-    preferred = base / "たすくま.xlsm"
-    if preferred.exists():
-        return preferred
-    candidates = sorted(base.glob("*.xlsm"))
-    return candidates[0] if candidates else None
-
-
-def excel_time_to_hhmm(value: str) -> str:
-    minutes = int(round(float(value) * 24 * 60))
-    hours, mins = divmod(minutes, 60)
-    return f"{hours % 24:02d}:{mins:02d}"
-
-
-def cell_text(cell, shared_strings):
-    value = cell.find("m:v", NS_MAIN)
-    if value is None or value.text is None:
-        return None
-    if cell.attrib.get("t") == "s":
-        try:
-            return shared_strings[int(value.text)]
-        except (ValueError, IndexError):
-            return None
-    return value.text
 
 
 def add_unique(items: list[str], value):
@@ -87,67 +50,18 @@ def add_unique(items: list[str], value):
         items.append(text)
 
 
-def read_dropdown_options(xlsm_path: Path | None):
-    sections, projects, tags = [], [], []
-    if xlsm_path is None or not xlsm_path.exists():
-        return sections, projects, tags
-
-    with zipfile.ZipFile(xlsm_path) as archive:
-        shared_strings = []
-        if "xl/sharedStrings.xml" in archive.namelist():
-            ss_root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
-            for si in ss_root.findall("m:si", NS_MAIN):
-                text = "".join((t.text or "") for t in si.findall(".//m:t", NS_MAIN))
-                shared_strings.append(text)
-
-        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-        rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-        relationship_map = {
-            rel.attrib["Id"]: rel.attrib["Target"]
-            for rel in rels.findall("r:Relationship", NS_RELS)
-        }
-
-        list_sheet_target = None
-        for sheet in workbook.findall("m:sheets/m:sheet", NS_MAIN):
-            name = sheet.attrib.get("name", "")
-            rid = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-            target = relationship_map.get(rid, "")
-            if name == "リスト":
-                list_sheet_target = f"xl/{target}"
-                break
-
-        if list_sheet_target is None:
-            fallback = "xl/worksheets/sheet3.xml"
-            if fallback in archive.namelist():
-                list_sheet_target = fallback
-            else:
+def load_list_options():
+    if LIST_OPTIONS_PATH.exists():
+        try:
+            data = json.loads(LIST_OPTIONS_PATH.read_text(encoding="utf-8"))
+            sections = data.get("sections", [])
+            projects = data.get("projects", [])
+            tags = data.get("tags", [])
+            if isinstance(sections, list) and isinstance(projects, list) and isinstance(tags, list):
                 return sections, projects, tags
-
-        list_sheet = ET.fromstring(archive.read(list_sheet_target))
-        ref_pattern = re.compile(r"^([A-Z]+)(\d+)$")
-
-        for cell in list_sheet.findall(".//m:sheetData//m:c", NS_MAIN):
-            ref = cell.attrib.get("r", "")
-            match = ref_pattern.match(ref)
-            if not match:
-                continue
-            col, row_text = match.groups()
-            row = int(row_text)
-            if row < 4:
-                continue
-
-            raw = cell_text(cell, shared_strings)
-            if col == "C" and raw is not None:
-                try:
-                    add_unique(sections, excel_time_to_hhmm(raw))
-                except ValueError:
-                    add_unique(sections, raw)
-            elif col == "D":
-                add_unique(projects, raw)
-            elif col == "E":
-                add_unique(tags, raw)
-
-    return sections, projects, tags
+        except Exception:
+            pass
+    return DEFAULT_SECTIONS.copy(), DEFAULT_PROJECTS.copy(), DEFAULT_TAGS.copy()
 
 
 def merge_with_current(base_options: list[str], current_series: pd.Series):
@@ -206,6 +120,113 @@ def normalize_schedule_to_hhmm(series: pd.Series) -> pd.Series:
         else:
             normalized.append(text)
     return pd.Series(normalized, index=series.index, dtype="string")
+
+
+def render_field_label(text: str):
+    st.markdown(
+        f"<div style='margin:0;padding:0;font-size:0.9rem;color:#111111;font-weight:600;line-height:1.05'>{text}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def estimated_option_labels():
+    return [str(v) for v in ESTIMATED_OPTIONS] + [ESTIMATED_OTHER]
+
+
+def estimated_from_choice(choice: str, other_value: int) -> int:
+    if choice == ESTIMATED_OTHER:
+        return int(other_value)
+    try:
+        return int(choice)
+    except Exception:
+        return 5
+
+
+def apply_app_style():
+    st.markdown(
+        """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap');
+
+:root {
+  --ink: #111111;
+  --muted: #4f5668;
+  --line: #d9deea;
+  --card: rgba(255,255,255,0.82);
+  --brand: #1e66f5;
+}
+
+.stApp {
+  font-family: 'Noto Sans JP', sans-serif;
+  background:
+    radial-gradient(1000px 380px at 0% 0%, #e8eefc 0%, rgba(232,238,252,0) 70%),
+    radial-gradient(900px 300px at 100% 10%, #e7f6ee 0%, rgba(231,246,238,0) 70%),
+    #eef2f8;
+}
+
+h1, h2, h3 {
+  font-family: 'Space Grotesk', 'Noto Sans JP', sans-serif !important;
+  color: var(--ink) !important;
+  letter-spacing: 0.01em;
+}
+
+h1 {
+  font-size: 2rem !important;
+  font-weight: 700 !important;
+}
+
+h3 {
+  border-left: 5px solid var(--brand);
+  padding-left: 10px;
+}
+
+[data-testid="stTextInput"] input,
+[data-testid="stDateInput"] input,
+[data-testid="stNumberInput"] input {
+  background: #ffffff !important;
+  border-radius: 10px !important;
+  border: 1.5px solid #9aa8c2 !important;
+  box-shadow: 0 1px 0 rgba(0,0,0,0.04) !important;
+}
+
+[data-testid="stSelectbox"] > div > div {
+  background: #ffffff !important;
+  border-radius: 10px !important;
+  border: 1.5px solid #9aa8c2 !important;
+  box-shadow: 0 1px 0 rgba(0,0,0,0.04) !important;
+}
+
+[data-testid="stTextArea"] textarea {
+  background: #ffffff !important;
+  border: 1.5px solid #9aa8c2 !important;
+  border-radius: 10px !important;
+}
+
+[data-testid="stDataEditor"] {
+  border: 1px solid #c7d1e3;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 6px;
+}
+
+.stButton button, .stDownloadButton button {
+  border-radius: 10px !important;
+  border: 1px solid #173f99 !important;
+  font-weight: 600 !important;
+}
+
+.stButton button:hover, .stDownloadButton button:hover {
+  border-color: var(--brand) !important;
+  color: var(--brand) !important;
+}
+
+[data-testid="stCodeBlock"] {
+  border-radius: 10px;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def empty_rows(count: int):
@@ -339,6 +360,7 @@ def decode_csv_payload(payload: str) -> tuple[bytes | None, int | None]:
 
 
 st.set_page_config(page_title="Task CSV Builder", layout="wide")
+apply_app_style()
 query_payload = st.query_params.get("payload")
 if isinstance(query_payload, list):
     query_payload = query_payload[0] if query_payload else ""
@@ -385,19 +407,13 @@ if query_token:
 st.title("Task CSV Builder")
 st.caption("スプレッドシート形式で入力してCSVを出力します。Schedule列は時間入力（空欄可）です。")
 
-xlsm_path = resolve_xlsm_path()
-section_options, project_options, tag_options = read_dropdown_options(xlsm_path)
-if not section_options:
-    section_options = FALLBACK_SECTIONS.copy()
-if not project_options:
-    project_options = FALLBACK_PROJECTS.copy()
-if not tag_options:
-    tag_options = FALLBACK_TAGS.copy()
+section_options, project_options, tag_options = load_list_options()
 
 default_due_date = date.today() + timedelta(days=1)
 default_section = "10:00"
-default_project = ".雑務"
+default_project = ". 雑務"
 default_estimated = 5
+default_tag = "自分"
 
 if "table_df" not in st.session_state:
     st.session_state.table_df = pd.DataFrame(columns=COLUMNS)
@@ -431,23 +447,23 @@ project_options = merge_with_current(project_options + [default_project], curren
 tag_options = merge_with_current(tag_options, current_df["Tag"])
 
 st.subheader("空欄時のデフォルト値")
-d1, d2, d3, d4, d5, d6, d7 = st.columns(7)
+d1, d2, d3, d4, d5, d6, d7 = st.columns(INPUT_COL_RATIOS)
 with d1:
-    st.caption("DueDate")
+    render_field_label("DueDate")
 with d2:
-    st.caption("Schedule(HHMM)")
+    render_field_label("Schedule(HHMM)")
 with d3:
-    st.caption("Section")
+    render_field_label("Section")
 with d4:
-    st.caption("Project")
+    render_field_label("Project")
 with d5:
-    st.caption("Tag")
+    render_field_label("Tag")
 with d6:
-    st.caption("TaskName")
+    render_field_label("Estimated")
 with d7:
-    st.caption("Estimated")
+    render_field_label("TaskName")
 
-col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+col1, col2, col3, col4, col5, col6, col7 = st.columns(INPUT_COL_RATIOS)
 with col1:
     input_default_due_date = st.date_input("DueDate", value=default_due_date, label_visibility="collapsed")
 with col2:
@@ -467,11 +483,33 @@ with col4:
         label_visibility="collapsed",
     )
 with col5:
-    input_default_tag = st.selectbox("Tag", options=tag_options, index=0, label_visibility="collapsed")
+    input_default_tag = st.selectbox(
+        "Tag",
+        options=tag_options,
+        index=tag_options.index(default_tag) if default_tag in tag_options else 0,
+        label_visibility="collapsed",
+    )
 with col6:
-    input_default_task_name = st.text_input("TaskName", value="", label_visibility="collapsed")
+    est_labels = estimated_option_labels()
+    input_default_est_choice = st.selectbox(
+        "Estimated選択",
+        options=est_labels,
+        index=est_labels.index(str(default_estimated)) if str(default_estimated) in est_labels else 0,
+        key="default_est_choice",
+        label_visibility="collapsed",
+    )
+    input_default_est_other = default_estimated
+    if input_default_est_choice == ESTIMATED_OTHER:
+        input_default_est_other = st.number_input(
+            "Estimatedその他",
+            min_value=0,
+            value=default_estimated,
+            step=1,
+            key="default_est_other",
+            label_visibility="collapsed",
+        )
 with col7:
-    input_default_estimated = st.number_input("Estimated", min_value=0, value=default_estimated, step=1, label_visibility="collapsed")
+    input_default_task_name = st.text_input("TaskName", value="", label_visibility="collapsed")
 
 defaults = {
     "due_date": input_default_due_date,
@@ -480,7 +518,7 @@ defaults = {
     "Project": input_default_project,
     "Tag": input_default_tag,
     "TaskName": input_default_task_name.strip(),
-    "Estimated": int(input_default_estimated),
+    "Estimated": estimated_from_choice(input_default_est_choice, input_default_est_other),
 }
 
 if st.session_state.get("bulk_clear_requested"):
@@ -495,55 +533,12 @@ if st.session_state.get("bulk_clear_requested"):
         elif key.startswith("bulk_task_") or key.startswith("bulk_est_"):
             del st.session_state[key]
 
-st.subheader("ダウンロード")
+st.subheader("ダウンロード用一時URL生成（10分間有効）")
 dl_col1, dl_col2 = st.columns([1, 2])
-with dl_col1:
-    encoding = st.selectbox(
-        "CSV文字コード",
-        options=["utf-8-sig", "cp932"],
-        index=0,
-        help="Excelで文字化けする場合は cp932 を選択してください。",
-    )
-    auto_public_url = current_app_base_url()
-    public_app_url_raw = st.text_input(
-        "公開URL（QR生成用）",
-        value=st.session_state.get("public_app_url", auto_public_url),
-        placeholder="https://xxxx.streamlit.app",
-        help="通常は自動で現在のアプリURLを使います。必要時のみ変更してください。",
-    ).strip()
-    if public_app_url_raw == "":
-        public_app_url_raw = auto_public_url
-    public_app_url = normalize_public_url(public_app_url_raw)
-    st.session_state["public_app_url"] = public_app_url
-    share_ttl = st.number_input("一時保存（分）", min_value=1, max_value=30, value=5, step=1)
-
-st.subheader("タスク入力シート")
-edited_df = st.data_editor(
-    current_df,
-    num_rows="fixed",
-    use_container_width=True,
-    key="task_sheet_editor",
-    column_config={
-        "DueDate": st.column_config.DateColumn("DueDate", format="YYYY/MM/DD"),
-        "Schedule": st.column_config.TextColumn("Schedule", help="HHMM または HH:MM 形式"),
-        "Section": st.column_config.SelectboxColumn("Section", options=section_options),
-        "Project": st.column_config.SelectboxColumn("Project", options=project_options),
-        "Tag": st.column_config.SelectboxColumn("Tag", options=tag_options),
-        "TaskName": st.column_config.TextColumn("TaskName"),
-        "Estimated": st.column_config.NumberColumn("Estimated", min_value=0, step=5),
-    },
-)
-if not edited_df.equals(current_df):
-    edited_df["Schedule"] = normalize_schedule_to_hhmm(edited_df["Schedule"])
-    st.session_state.table_df = edited_df.copy()
-    st.rerun()
-else:
-    edited_df["Schedule"] = normalize_schedule_to_hhmm(edited_df["Schedule"])
-    st.session_state.table_df = edited_df.copy()
 
 st.subheader("テキスト行数ぶんの入力ブロック")
 bulk_text = st.text_area(
-    "1行につき1タスク（行数ぶん入力ブロックを作成）",
+    "下のテキストに1行以上入力すると、行数分入力ブロックを表示します（複数タスクは改行して入力）",
     key="bulk_seed_text",
     placeholder="買い物\n資料作成\nメール返信",
     height=120,
@@ -559,30 +554,33 @@ if st.session_state.get("bulk_signature") != bulk_signature:
         st.session_state[f"bulk_project_{i}"] = defaults["Project"]
         st.session_state[f"bulk_tag_{i}"] = defaults["Tag"]
         st.session_state[f"bulk_task_{i}"] = line
-        st.session_state[f"bulk_est_{i}"] = int(defaults["Estimated"])
+        if int(defaults["Estimated"]) in ESTIMATED_OPTIONS:
+            st.session_state[f"bulk_est_choice_{i}"] = str(int(defaults["Estimated"]))
+            st.session_state[f"bulk_est_other_{i}"] = 5
+        else:
+            st.session_state[f"bulk_est_choice_{i}"] = ESTIMATED_OTHER
+            st.session_state[f"bulk_est_other_{i}"] = int(defaults["Estimated"])
     st.session_state["bulk_signature"] = bulk_signature
 
-if not bulk_lines:
-    st.info("下のテキストに1行以上入力すると、行数ぶん入力ブロックを表示します。")
-else:
-    h1, h2, h3, h4, h5, h6, h7 = st.columns(7)
+if bulk_lines:
+    h1, h2, h3, h4, h5, h6, h7 = st.columns(INPUT_COL_RATIOS)
     with h1:
-        st.caption("DueDate")
+        render_field_label("DueDate")
     with h2:
-        st.caption("Schedule(HHMM)")
+        render_field_label("Schedule(HHMM)")
     with h3:
-        st.caption("Section")
+        render_field_label("Section")
     with h4:
-        st.caption("Project")
+        render_field_label("Project")
     with h5:
-        st.caption("Tag")
+        render_field_label("Tag")
     with h6:
-        st.caption("TaskName")
+        render_field_label("Estimated")
     with h7:
-        st.caption("Estimated")
+        render_field_label("TaskName")
 
     for i, _line in enumerate(bulk_lines):
-        b1, b2, b3, b4, b5, b6, b7 = st.columns(7)
+        b1, b2, b3, b4, b5, b6, b7 = st.columns(INPUT_COL_RATIOS)
         with b1:
             st.date_input("DueDate", key=f"bulk_due_{i}", label_visibility="collapsed")
         with b2:
@@ -594,9 +592,22 @@ else:
         with b5:
             st.selectbox("Tag", options=tag_options, key=f"bulk_tag_{i}", label_visibility="collapsed")
         with b6:
-            st.text_input("TaskName", key=f"bulk_task_{i}", label_visibility="collapsed")
+            st.selectbox(
+                "Estimated選択",
+                options=estimated_option_labels(),
+                key=f"bulk_est_choice_{i}",
+                label_visibility="collapsed",
+            )
+            if st.session_state.get(f"bulk_est_choice_{i}") == ESTIMATED_OTHER:
+                st.number_input(
+                    "Estimatedその他",
+                    min_value=0,
+                    step=1,
+                    key=f"bulk_est_other_{i}",
+                    label_visibility="collapsed",
+                )
         with b7:
-            st.number_input("Estimated", min_value=0, step=1, key=f"bulk_est_{i}", label_visibility="collapsed")
+            st.text_input("TaskName", key=f"bulk_task_{i}", label_visibility="collapsed")
 
     if st.button("入力ブロックをシートに追加"):
         rows = []
@@ -612,7 +623,10 @@ else:
                     "Project": st.session_state.get(f"bulk_project_{i}", ""),
                     "Tag": st.session_state.get(f"bulk_tag_{i}", ""),
                     "TaskName": task_name,
-                    "Estimated": int(st.session_state.get(f"bulk_est_{i}", defaults["Estimated"])),
+                    "Estimated": estimated_from_choice(
+                        st.session_state.get(f"bulk_est_choice_{i}", str(defaults["Estimated"])),
+                        int(st.session_state.get(f"bulk_est_other_{i}", defaults["Estimated"])),
+                    ),
                 }
             )
         if rows:
@@ -623,6 +637,31 @@ else:
             st.session_state["bulk_clear_requested"] = True
             st.rerun()
 
+st.subheader("タスク入力シート")
+edited_df = st.data_editor(
+    current_df,
+    num_rows="fixed",
+    use_container_width=True,
+    key="task_sheet_editor",
+    column_order=UI_COLUMN_ORDER,
+    column_config={
+        "DueDate": st.column_config.DateColumn("DueDate", format="YYYY/MM/DD", width="small"),
+        "Schedule": st.column_config.TextColumn("Schedule", help="HHMM または HH:MM 形式", width="small"),
+        "Section": st.column_config.SelectboxColumn("Section", options=section_options, width="small"),
+        "Project": st.column_config.SelectboxColumn("Project", options=project_options, width="small"),
+        "Tag": st.column_config.SelectboxColumn("Tag", options=tag_options, width="small"),
+        "TaskName": st.column_config.TextColumn("TaskName", width="large"),
+        "Estimated": st.column_config.NumberColumn("Estimated", min_value=0, step=5, width="small"),
+    },
+)
+if not edited_df.equals(current_df):
+    edited_df["Schedule"] = normalize_schedule_to_hhmm(edited_df["Schedule"])
+    st.session_state.table_df = edited_df.copy()
+    st.rerun()
+else:
+    edited_df["Schedule"] = normalize_schedule_to_hhmm(edited_df["Schedule"])
+    st.session_state.table_df = edited_df.copy()
+
 output_df = fill_blank_with_default(st.session_state.table_df, defaults).reindex(columns=COLUMNS)
 output_df["TaskName"] = output_df["TaskName"].astype("string").fillna("").str.strip()
 output_df = output_df[output_df["TaskName"] != ""].copy()
@@ -631,24 +670,23 @@ output_df["DueDate"] = pd.to_datetime(output_df["DueDate"], errors="coerce").dt.
 output_df["DueDate"] = output_df["DueDate"].fillna("")
 output_df["Schedule"] = normalize_schedule_to_hhmm(output_df["Schedule"]).fillna("")
 
-csv_bytes = output_df.to_csv(index=False).encode(encoding, errors="replace")
+csv_bytes = output_df.to_csv(index=False).encode(FIXED_CSV_ENCODING, errors="replace")
 with dl_col1:
-    st.download_button(
+    btn1, btn2 = st.columns(2)
+    btn1.download_button(
         label="CSVをダウンロード",
         data=csv_bytes,
         file_name="tasks.csv",
         mime="text/csv",
+        use_container_width=True,
     )
-    if st.button("iPhone取り込み用 一時URLを作成", use_container_width=True):
-        if not st.session_state.get("public_app_url", "").strip():
-            st.error("先に「公開URL（QR生成用）」を入力してください。")
-        else:
-            base = st.session_state["public_app_url"]
-            payload = encode_csv_payload(csv_bytes, int(share_ttl))
-            share_url = f"{base}/?payload={payload}"
-            st.session_state.share_token = ""
-            st.session_state.share_expires_at = datetime.now(timezone.utc) + timedelta(minutes=int(share_ttl))
-            st.session_state.share_url = share_url
+    if btn2.button("iPhone取り込み用一時URLを作成", use_container_width=True):
+        base = normalize_public_url(current_app_base_url())
+        payload = encode_csv_payload(csv_bytes, FIXED_SHARE_TTL_MINUTES)
+        share_url = f"{base}/?payload={payload}"
+        st.session_state.share_token = ""
+        st.session_state.share_expires_at = datetime.now(timezone.utc) + timedelta(minutes=FIXED_SHARE_TTL_MINUTES)
+        st.session_state.share_url = share_url
 
 with dl_col2:
     if st.session_state.share_url:
@@ -656,7 +694,11 @@ with dl_col2:
         if remain > 0:
             st.caption(f"一時URL（残り約 {remain} 秒）")
             st.code(st.session_state.share_url)
-            st.image(make_qr_png(st.session_state.share_url), caption="iPhoneでQRを読み取ってダウンロード")
+            st.image(
+                make_qr_png(st.session_state.share_url),
+                caption="iPhoneでQRを読み取ってダウンロード",
+                width=540,
+            )
         else:
             st.warning("一時URLの有効期限が切れました。再作成してください。")
             st.session_state.share_url = ""
