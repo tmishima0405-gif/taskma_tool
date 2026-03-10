@@ -769,7 +769,7 @@ with dl_col1:
         mime="text/csv",
         use_container_width=True,
     )
-    if btn2.button("iPhone取り込み用一時URLを作成", use_container_width=True):
+    if btn2.button("取込用URL", use_container_width=True):
         share_url, err = create_supabase_signed_csv_url(csv_bytes, FIXED_SHARE_TTL_MINUTES)
         if not share_url:
             base = normalize_public_url(current_app_base_url())
